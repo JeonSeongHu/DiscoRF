@@ -173,14 +173,13 @@ def reconstruction(args):
     torch.cuda.empty_cache()
     PSNRs, PSNRs_test = [], [0]
 
-    dilated = [20, 20, 20, 20, 20]
-    dilated_index = 0
+    dilated = 20
 
     allrays, allrgbs = train_dataset.all_rays, train_dataset.all_rgbs
     # if not args.ndc_ray:
     #     allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs, bbox_only=True)
     # trainingSampler = SimpleSampler(allrays.shape[0], args.batch_size)
-    trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])
+    trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated)
 
     Ortho_reg_weight = args.Ortho_weight
     print("initial Ortho_reg_weight", Ortho_reg_weight)
@@ -270,10 +269,6 @@ def reconstruction(args):
             #     # filter rays outside the bbox
             #     allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs)
             #     trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])
-
-        if iteration and iteration % 10000 == 0:
-            dilated_index += 1
-            trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])
 
         if iteration in upsamp_list:
             n_voxels = N_voxel_list.pop(0)
