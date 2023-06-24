@@ -1,20 +1,39 @@
 import os
+
+import torch
 from tqdm.auto import tqdm
 from opt import config_parser
-
+import matplotlib.pyplot as plt
+import math
 import json, random
 from renderer import *
 from utils import *
 from torch.utils.tensorboard import SummaryWriter
 import datetime
-import math
 
 from dataLoader import dataset_dict
 import sys
+from models.discriminator import ResNetDiscriminator
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 renderer = OctreeRender_trilinear_fast
+
+
+# class SimpleSampler:
+#     def __init__(self, total, batch):
+#         self.total = total
+#         self.half = math.sqrt(total)
+#         self.batch = batch
+#         self.curr = total
+#         self.ids = None
+#
+#     def nextids(self):
+#         self.curr+=self.batch
+#         if self.curr + self.batch > self.total:
+#             self.ids = torch.LongTensor(np.random.permutation(self.total))
+#             self.curr = 0
+#         return self.ids[self.curr:self.curr+self.batch]
 
 class GridSampler:
     def __init__(self, total, batch, dilated=4):
@@ -40,20 +59,9 @@ class GridSampler:
         sampled_rays += img_num * self.H ** 2
         return self.ids[sampled_rays]
 
-class SimpleSampler:
-    def __init__(self, total, batch):
-        self.total = total
-        self.batch = batch
-        self.curr = total
-        self.ids = None
 
-    def nextids(self):
-        self.curr += self.batch
-        if self.curr + self.batch > self.total:
-            self.ids = torch.LongTensor(np.random.permutation(self.total))
-            self.curr = 0
-        return self.ids[self.curr:self.curr + self.batch]
-
+# a=GridSampler(49,9,1)
+# a.nextids()
 
 @torch.no_grad()
 def export_mesh(args):
@@ -165,6 +173,11 @@ def reconstruction(args):
 
     optimizer = torch.optim.Adam(grad_vars, betas=(0.9, 0.99))
 
+    #  discriminator
+    discriminator = ResNetDiscriminator().to(device)
+    adversarial_loss = nn.BCEWithLogitsLoss()
+    discriminator_optimizer = torch.optim.Adam(discriminator.parameters(), betas=(0.5, 0.99), lr=0.0001)
+
     # linear in logrithmic space
     N_voxel_list = (torch.round(torch.exp(
         torch.linspace(np.log(args.N_voxel_init), np.log(args.N_voxel_final), len(upsamp_list) + 1))).long()).tolist()[
@@ -175,12 +188,12 @@ def reconstruction(args):
 
     dilated = [20, 20, 20, 20, 20]
     dilated_index = 0
-
     allrays, allrgbs = train_dataset.all_rays, train_dataset.all_rgbs
+    print(allrays.shape, allrgbs.shape)
     # if not args.ndc_ray:
-    #     allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs, bbox_only=True)
+    # allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs, bbox_only=True)
     # trainingSampler = SimpleSampler(allrays.shape[0], args.batch_size)
-    trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])
+    trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])  # GridSampler로 교체
 
     Ortho_reg_weight = args.Ortho_weight
     print("initial Ortho_reg_weight", Ortho_reg_weight)
@@ -197,44 +210,92 @@ def reconstruction(args):
         ray_idx = trainingSampler.nextids()
         rays_train, rgb_train = allrays[ray_idx], allrgbs[ray_idx].to(device)
 
-        # rgb_map, alphas_map, depth_map, weights, uncertainty
-        rgb_map, alphas_map, depth_map, weights, uncertainty = renderer(rays_train, tensorf, chunk=args.batch_size,
-                                                                        N_samples=nSamples, white_bg=white_bg,
-                                                                        ndc_ray=ndc_ray, device=device, is_train=True)
+        # for discriminator loss
+        rgb_map_fake, alphas_map_fake, depth_map_fake, weights_fake, uncertainty_fake \
+            = renderer(rays_train, tensorf, chunk=args.batch_size,
+                       N_samples=nSamples, white_bg=white_bg, ndc_ray=ndc_ray, device=device, is_train=True)
 
-        loss = torch.mean((rgb_map - rgb_train) ** 2)
+        # for L2 loss
+        rgb_map, alphas_map, depth_map, weights, uncertainty \
+            = renderer(rays_train, tensorf, chunk=args.batch_size,
+                       N_samples=nSamples, white_bg=white_bg, ndc_ray=ndc_ray, device=device, is_train=True)
 
-        # loss
-        total_loss = loss
-        if Ortho_reg_weight > 0:
-            loss_reg = tensorf.vector_comp_diffs()
-            total_loss += Ortho_reg_weight * loss_reg
-            summary_writer.add_scalar('train/reg', loss_reg.detach().item(), global_step=iteration)
-        if L1_reg_weight > 0:
-            loss_reg_L1 = tensorf.density_L1()
-            total_loss += L1_reg_weight * loss_reg_L1
-            summary_writer.add_scalar('train/reg_l1', loss_reg_L1.detach().item(), global_step=iteration)
+        # discriminator loss
+        h = int(math.sqrt(rgb_train.shape[0]))
+        real_predictions = discriminator(rgb_train.reshape(1, 3, h, h))
+        fake_predictions = discriminator(rgb_map_fake.reshape(1, 3, h, h).detach())
 
-        if TV_weight_density > 0:
-            TV_weight_density *= lr_factor
-            loss_tv = tensorf.TV_loss_density(tvreg) * TV_weight_density
-            total_loss = total_loss + loss_tv
-            summary_writer.add_scalar('train/reg_tv_density', loss_tv.detach().item(), global_step=iteration)
-        if TV_weight_app > 0:
-            TV_weight_app *= lr_factor
-            loss_tv = tensorf.TV_loss_app(tvreg) * TV_weight_app
-            total_loss = total_loss + loss_tv
-            summary_writer.add_scalar('train/reg_tv_app', loss_tv.detach().item(), global_step=iteration)
+        real_labels = torch.ones(real_predictions.size()).to(device)
+        fake_labels = torch.zeros(fake_predictions.size()).to(device)
+        discriminator_loss = adversarial_loss(real_predictions, real_labels) \
+                             + adversarial_loss(fake_predictions, fake_labels)
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        discriminator_loss.backward()
+        discriminator_optimizer.step()
 
-        loss = loss.detach().item()
+        if not (iteration % 10):
+            # generator loss
+            rgb_map_fake, alphas_map_fake, depth_map_fake, weights_fake, uncertainty_fake \
+                = renderer(rays_train, tensorf, chunk=args.batch_size,
+                           N_samples=nSamples, white_bg=white_bg, ndc_ray=ndc_ray, device=device, is_train=True)
 
-        PSNRs.append(-10.0 * np.log(loss) / np.log(10.0))
-        summary_writer.add_scalar('train/PSNR', PSNRs[-1], global_step=iteration)
-        summary_writer.add_scalar('train/mse', loss, global_step=iteration)
+            fake_predictions_generator = discriminator(rgb_map_fake.reshape(1, 3, h, h))
+            generator_loss = adversarial_loss(fake_predictions_generator, real_labels)
+
+            # if iteration and not (iteration % 1000):
+            #     fig = plt.figure()
+            #     rows, cols = 1, 2
+            #
+            #     ax1 = fig.add_subplot(rows, cols, 1)
+            #     ax1.imshow(rgb_map.reshape(32, 32, 3).cpu().detach())
+            #     ax1.set_title('Rendered patch')
+            #     ax1.axis("off")
+            #
+            #     ax2 = fig.add_subplot(rows, cols, 2)
+            #     ax2.imshow(rgb_train.reshape(32, 32, 3).cpu().detach())
+            #     ax2.set_title('GT')
+            #     ax2.axis("off")
+            #
+            #     plt.show()
+
+            aux_loss, img_loss = 0, 0
+
+            if Ortho_reg_weight > 0:
+                loss_reg = tensorf.vector_comp_diffs()
+                aux_loss += Ortho_reg_weight * loss_reg
+                summary_writer.add_scalar('train/reg', loss_reg.detach().item(), global_step=iteration)
+            if L1_reg_weight > 0:
+                loss_reg_L1 = tensorf.density_L1()
+                aux_loss += L1_reg_weight * loss_reg_L1
+                summary_writer.add_scalar('train/reg_l1', loss_reg_L1.detach().item(), global_step=iteration)
+
+            if TV_weight_density > 0:
+                TV_weight_density *= lr_factor
+                loss_tv = tensorf.TV_loss_density(tvreg) * TV_weight_density
+                aux_loss += loss_tv
+                summary_writer.add_scalar('train/reg_tv_density', loss_tv.detach().item(), global_step=iteration)
+
+            if TV_weight_app > 0:
+                TV_weight_app *= lr_factor
+                loss_tv = tensorf.TV_loss_app(tvreg) * TV_weight_app
+                aux_loss += loss_tv
+                summary_writer.add_scalar('train/reg_tv_app', loss_tv.detach().item(), global_step=iteration)
+
+            img_loss = torch.mean((rgb_map - rgb_train) ** 2)
+            total_loss = img_loss + generator_loss + aux_loss
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
+
+            loss = total_loss.detach().item()
+
+            PSNRs.append(-10.0 * np.log(img_loss.cpu().detach()) / np.log(10.0))
+            # PSNRs.append(-10.0 * np.log(img_loss) / np.log(10.0))
+            summary_writer.add_scalar('train/PSNR', PSNRs[-1], global_step=iteration)
+            summary_writer.add_scalar('train/mse', loss, global_step=iteration)
+            summary_writer.add_scalar('train/generator_loss', generator_loss, global_step=iteration)
+            summary_writer.add_scalar('train/discriminator_loss', discriminator_loss, global_step=iteration)
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = param_group['lr'] * lr_factor
@@ -246,6 +307,8 @@ def reconstruction(args):
                 + f' train_psnr = {float(np.mean(PSNRs)):.2f}'
                 + f' test_psnr = {float(np.mean(PSNRs_test)):.2f}'
                 + f' mse = {loss:.6f}'
+                + f' dis_loss = {discriminator_loss:.3f}'
+                + f' gen_loss= {generator_loss:.3f}'
             )
             PSNRs = []
 
@@ -256,7 +319,6 @@ def reconstruction(args):
             summary_writer.add_scalar('test/psnr', np.mean(PSNRs_test), global_step=iteration)
 
         if iteration in update_AlphaMask_list:
-
             if reso_cur[0] * reso_cur[1] * reso_cur[2] < 256 ** 3:  # update volume resolution
                 reso_mask = reso_cur
             new_aabb = tensorf.updateAlphaMask(tuple(reso_mask))
@@ -268,9 +330,8 @@ def reconstruction(args):
 
             # if not args.ndc_ray and iteration == update_AlphaMask_list[1]:
             #     # filter rays outside the bbox
-            #     allrays, allrgbs = tensorf.filtering_rays(allrays, allrgbs)
-            #     trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])
-
+            #     allrays,allrgbs = tensorf.filtering_rays(allrays,allrgbs)
+            #     trainingSampler = GridSampler(allrgbs.shape[0], args.batch_size, dilated)
         if iteration and iteration % 10000 == 0:
             dilated_index += 1
             trainingSampler = GridSampler(allrays.shape[0], args.batch_size, dilated[dilated_index])
@@ -330,3 +391,4 @@ if __name__ == '__main__':
         render_test(args)
     else:
         reconstruction(args)
+
