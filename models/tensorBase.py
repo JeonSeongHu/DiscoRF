@@ -407,7 +407,6 @@ class TensorBase(torch.nn.Module):
 
 
     def forward(self, rays_chunk, white_bg=True, is_train=False, ndc_ray=False, N_samples=-1):
-
         # sample points
         viewdirs = rays_chunk[:, 3:6]
         if ndc_ray:
