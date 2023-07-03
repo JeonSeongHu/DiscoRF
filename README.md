@@ -1,7 +1,7 @@
 # DiscoRF: Discriminator on TensoRF
 
-Byeongwoo Jeon, Seoyeon Byeon, Suhyeok Kim, Seonghu Jeon, Hoongyu Chung <br>
-
+### Byeongwoo Jeon, Seoyeon Byeon, Suhyeok Kim, Seonghu Jeon, Hoongyu Chung
+![figure](modelfigure1.png)
 This repository contains a pytorch implementation for the Korea University DATA302 Project, "DiscoRF: Discriminator on TensoRF". All of the settings below follow the original paper, [TensoRF](https://apchenstu.github.io/TensoRF/).
 
 ## Installation
