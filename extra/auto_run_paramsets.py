@@ -87,7 +87,7 @@ if __name__ == '__main__':
 
     # n_iters = 30000
     # for data_name in ['Robot']:#'Bike','Lifestyle','Palace','Robot','Spaceship','Steamtrain','Toad','Wineholder'
-    #     cmd = f'CUDA_VISIBLE_DEVICES={cuda}  python train.py ' \
+    #     cmd = f'CUDA_VISIBLE_DEVICES={cuda}  python train_gridOnly.py ' \
     #           f'--dataset_name nsvf --datadir /mnt/new_disk_2/anpei/Dataset/TeRF/Synthetic_NSVF/{data_name} '\
     #           f'--expname {data_name} --batch_size {batch_size} ' \
     #           f'--n_iters {n_iters}  ' \
